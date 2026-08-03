@@ -1,0 +1,4 @@
+{
+  "_comment": "Optional allowlist. Copy to config.json beside HddSpindown.ps1 or to %LOCALAPPDATA%\\HddSpindown\\config.json. If AllowedDisks is non-empty, Lock only allows matching UniqueId/SerialNumber. Leave AllowedDisks empty (or delete config.json) to allow any non-system disk. Get ids via: .\\HddSpindown.ps1 List   and   Get-Disk | Format-List Number,SerialNumber,UniqueId",
+  "AllowedDisks": []
+}
