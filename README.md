@@ -195,6 +195,3 @@ After PnP disable/enable or hardware changes, disk numbers can shift. The script
 - `List` and `Status` intentionally avoid probing locked disks so listing does not wake them.
 - Locking multiple disks at once, or running two instances concurrently, is not protected by a lock file — `state.json` writes could race. Run one `Lock`/`Unlock`/`Respin` at a time.
 
-## License
-
-See repository license (add one if distributing).
