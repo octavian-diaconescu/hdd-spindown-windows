@@ -81,6 +81,9 @@ hddspindown Lock -DriveLetter F -Soft -Force
 hddspindown Unlock -DiskNumber 2
 hddspindown Unlock -DriveLetter D,F
 
+# Unlock every locked disk at once
+hddspindown Unlock -a
+
 # What's locked (reads state only — does not probe disks)
 hddspindown Status
 
@@ -98,7 +101,7 @@ hddspindown Respin
 | `Status` | No | Show locked disks from `state.json` only |
 | `Lock` | Yes (UAC) | Offline, standby, optional PnP disable |
 | `Unlock` | Yes (UAC) | Online, restore letters, clear lock state |
-| `Respin` | Yes (UAC) | Re-send standby to all locked disks |
+| `Respin` | Yes (UAC) | Re-send standby to all locked disks; heal stale state; offer to re-lock disks that came back online |
 | `Install` | No | Add `hddspindown` to user PATH |
 
 ## Parameters
@@ -107,8 +110,9 @@ hddspindown Respin
 |-----------|---------|-------------|
 | `-DiskNumber` | Lock, Unlock | Disk index, e.g. `2` or `2,3,4` |
 | `-DriveLetter` | Lock, Unlock | Letter(s), e.g. `D` or `F,D,E` |
-| `-Force` | Lock | Skip confirmation prompt |
+| `-Force` | Lock, Unlock, Respin | Skip confirmation prompt (Respin: re-lock back-online disks without asking) |
 | `-Soft` | Lock | Offline + standby only; skip PnP disable |
+| `-All` / `-a` | Unlock | Unlock every disk recorded in `state.json` |
 
 ## After reboot
 
@@ -123,6 +127,14 @@ hddspindown Respin
 ```
 
 For **hard (PnP) locks**, `Respin` briefly enables each device, sends standby, then disables PnP again — required because a disabled disk has no `\\.\PhysicalDrive` handle.
+
+### Self-healing state
+
+Windows renumbers disks and can re-enumerate a drive under a new PnP instance id (after a port change, controller driver update, or feature update). `Respin` and `Unlock` repair `state.json` instead of failing:
+
+- Disks are matched by **UniqueId / SerialNumber**, never by disk number alone, so a renumbered disk is still found and other locked entries are never overwritten.
+- A **stale PnP instance id** is replaced with the current one (looked up live, or, for a disabled device, by matching the model name among disabled disk devices). If several disabled disks share a model name, it asks you to resolve it manually rather than guess.
+- If Windows **brought a locked disk back online**, `Respin` lists it and offers to re-lock it (`Respin -Force` re-locks without asking).
 
 ## SATA sibling wake
 
@@ -181,11 +193,11 @@ Letters are saved at lock time. If the disk had no letters when locked, assign t
 
 ### `List` shows `StaleLock`
 
-State says locked but the disk is online — run `Unlock` to clean up, or lock again if you want it offline.
+State says locked but the disk is online (often Windows re-onlined it after re-enumerating the device). Run `Respin -Force` to re-lock it, or `Unlock` to drop it from state.
 
 ### Disk numbers changed
 
-After PnP disable/enable or hardware changes, disk numbers can shift. The script matches by `UniqueId` / `SerialNumber` in state for unlock and respin.
+After PnP disable/enable, reboots, or hardware changes, disk numbers can shift. The script matches by `UniqueId` / `SerialNumber` and refreshes the saved number and PnP id during `Respin` / `Unlock`. The `Number` shown by `List` / `Status` for a locked disk is the last one seen.
 
 ## Limitations
 

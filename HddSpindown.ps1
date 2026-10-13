@@ -28,6 +28,7 @@
   .\HddSpindown.ps1 Lock -DriveLetter F,D -Soft
   .\HddSpindown.ps1 Unlock -DiskNumber 0,1
   .\HddSpindown.ps1 Unlock -DriveLetter F,D
+  .\HddSpindown.ps1 Unlock -All        (or: hddspindown unlock -a)
   .\HddSpindown.ps1 Respin
   .\HddSpindown.ps1 Status
   .\HddSpindown.ps1 Install
@@ -49,6 +50,9 @@
   Respin: on-demand re-standby of locked disks. For hard (PnP) locks it briefly
   enables each device, sends STANDBY IMMEDIATE, then disables again — required
   because a disabled DiskDrive has no \\.\PhysicalDrive handle after reboot.
+  Respin also heals stale state: disks are matched by UniqueId/SerialNumber (disk
+  numbers shift), stale PnP instance ids are re-resolved, and locked disks that
+  Windows brought back online are offered for re-lock (-Force: no prompt).
 
   Re-locking an already-locked disk uses state only (no Get-Disk/Get-Partition)
   so it will not wake siblings just to look the disk up.
@@ -69,7 +73,16 @@ param(
     [switch] $Force,
 
     # Lock: offline + standby only (do not Disable-PnpDevice)
-    [switch] $Soft
+    [switch] $Soft,
+
+    # Unlock: every disk recorded in state.json (-a for short)
+    [Alias('a')]
+    [switch] $All,
+
+    # Internal: set by Request-ElevationAndExit on the relaunched elevated process
+    # so errors can pause the (otherwise-closing) new console window instead of
+    # vanishing before they can be read.
+    [switch] $Elevated
 )
 
 Set-StrictMode -Version Latest
@@ -133,6 +146,7 @@ function Request-ElevationAndExit {
     [void]$argTokens.Add('-File')
     [void]$argTokens.Add((ConvertTo-ElevatedArgToken $PSCommandPath))
     [void]$argTokens.Add((ConvertTo-ElevatedArgToken $Action))
+    [void]$argTokens.Add('-Elevated')
 
     if ($null -ne $DiskNumber -and (ConvertTo-CliArgValue $DiskNumber) -ne '') {
         [void]$argTokens.Add('-DiskNumber')
@@ -144,6 +158,7 @@ function Request-ElevationAndExit {
     }
     if ($Force) { [void]$argTokens.Add('-Force') }
     if ($Soft) { [void]$argTokens.Add('-Soft') }
+    if ($All) { [void]$argTokens.Add('-All') }
 
     # Single string is the reliable form for Verb RunAs + paths with spaces.
     $argumentList = ($argTokens -join ' ')
@@ -596,8 +611,10 @@ function Test-PnpInstanceDisabled {
 
 function Find-DiskByLockedEntry {
     <#
-      Disk numbers shift after PnP disable/enable. Prefer UniqueId, then SerialNumber,
-      then the Number saved in state.
+      Disk numbers shift after PnP disable/enable and reboots. Match by UniqueId, then
+      SerialNumber. The saved Number is only used when the entry has neither — otherwise
+      a different disk that inherited the number could be returned (and then forced
+      offline / spun down) while the real one is still re-enumerating.
     #>
     param([Parameter(Mandatory)] $Entry)
 
@@ -621,7 +638,7 @@ function Find-DiskByLockedEntry {
             if (([string](Get-DiskProp $d 'SerialNumber' '')).Trim() -eq $serial) { return $d }
         }
     }
-    if ($null -ne $savedNum) {
+    if ($null -ne $savedNum -and -not $uid -and -not $serial) {
         foreach ($d in $all) {
             if ([int]$d.Number -eq $savedNum) { return $d }
         }
@@ -652,23 +669,96 @@ function Update-LockedEntryNumber {
     )
     $old = [int](Get-DiskProp $Entry 'Number' -1)
     if ($old -eq $NewNumber) { return }
+    Update-LockedEntryField -Entry $Entry -Name 'Number' -Value $NewNumber
+}
+
+function Update-LockedEntryField {
+    # Persist one field on the state entry for this disk (matched by identity, not Number).
+    param(
+        [Parameter(Mandatory)] $Entry,
+        [Parameter(Mandatory)][string] $Name,
+        $Value
+    )
     $state = Read-State
-    $uid = [string](Get-DiskProp $Entry 'UniqueId' '')
-    $serial = ([string](Get-DiskProp $Entry 'SerialNumber' '')).Trim()
     $changed = $false
     foreach ($e in @($state.LockedDisks)) {
-        $same = ($uid -and ([string](Get-DiskProp $e 'UniqueId' '') -eq $uid)) -or
-                ($serial -and (([string](Get-DiskProp $e 'SerialNumber' '')).Trim() -eq $serial)) -or
-                (($null -ne (Get-DiskProp $e 'Number' $null)) -and ([int]$e.Number -eq $old))
-        if ($same) {
-            $e | Add-Member -NotePropertyName Number -NotePropertyValue $NewNumber -Force
+        if (Test-SameDisk $e $Entry) {
+            $e | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
             $changed = $true
         }
     }
-    if ($changed) {
-        Write-State -State $state
-        $Entry | Add-Member -NotePropertyName Number -NotePropertyValue $NewNumber -Force
+    if ($changed) { Write-State -State $state }
+    $Entry | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
+function Get-DisabledDiskPnpDevices {
+    Import-Module PnpDevice -ErrorAction SilentlyContinue | Out-Null
+    $devs = @()
+    try { $devs = @(Get-PnpDevice -Class DiskDrive -PresentOnly -ErrorAction SilentlyContinue) } catch { }
+    Write-Output -NoEnumerate @($devs | Where-Object {
+        $problem = [string](Get-DiskProp $_ 'Problem' '')
+        $problem -match 'DISABLED'
+    })
+}
+
+function Resolve-LockedEntryPnpId {
+    <#
+      PnP instance ids encode the port/location, so they change when a drive moves
+      ports, the controller driver is updated, or Windows re-enumerates the device.
+      A stale id makes enable/disable fail and leaves the disk stuck disabled.
+
+      Returns a current instance id for the entry (saving it to state if it changed),
+      or $null if none can be determined.
+    #>
+    param([Parameter(Mandatory)] $Entry)
+    Import-Module PnpDevice -ErrorAction SilentlyContinue | Out-Null
+
+    $name = ([string](Get-DiskProp $Entry 'FriendlyName' '')).Trim()
+    $stored = [string](Get-DiskProp $Entry 'PnpDeviceId' '')
+
+    if ($stored) {
+        $dev = $null
+        try { $dev = Get-PnpDevice -InstanceId $stored -ErrorAction SilentlyContinue } catch { }
+        if ($dev -and (Get-DiskProp $dev 'Present' $true)) { return $stored }
     }
+
+    $newId = $null
+
+    # Enabled: the storage stack can see it, so ask it directly.
+    $live = Find-DiskByLockedEntry -Entry $Entry
+    if ($live) {
+        $newId = Get-DiskPnpInstanceId -Number ([int]$live.Number)
+    }
+
+    # Disabled devices are invisible to Get-Disk / Win32_DiskDrive. Match by model
+    # name among disabled disk devices that no other locked entry already owns.
+    if (-not $newId -and $name) {
+        $claimed = @{}
+        foreach ($e in @((Read-State).LockedDisks)) {
+            if (Test-SameDisk $e $Entry) { continue }
+            $id = [string](Get-DiskProp $e 'PnpDeviceId' '')
+            if ($id) { $claimed[$id] = $true }
+        }
+        $candidates = @((Get-DisabledDiskPnpDevices) | Where-Object {
+            -not $claimed.ContainsKey([string]$_.InstanceId) -and
+            ([string](Get-DiskProp $_ 'FriendlyName' '')).IndexOf($name, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        })
+        if ($candidates.Count -eq 1) {
+            $newId = [string]$candidates[0].InstanceId
+        } elseif ($candidates.Count -gt 1) {
+            Write-Warning ("  '{0}': {1} disabled disk devices share this model name; cannot tell which is the locked one. Enable it in Device Manager and run Unlock." -f $name, $candidates.Count)
+        }
+    }
+
+    if ($newId -and $newId -ne $stored) {
+        Write-Host ("  '{0}': PnP instance id changed; state updated.`n    old: {1}`n    new: {2}" -f $name, $(if ($stored) { $stored } else { '(none)' }), $newId)
+        Update-LockedEntryField -Entry $Entry -Name 'PnpDeviceId' -Value $newId
+        return $newId
+    }
+    if (-not $newId -and $stored) {
+        Write-Warning ("  '{0}': saved PnP instance id is no longer present and no replacement was found." -f $name)
+    }
+    return $newId
 }
 
 function Invoke-RespinDownLockedDisks {
@@ -683,7 +773,9 @@ function Invoke-RespinDownLockedDisks {
     #>
     param(
         [string] $Reason = 'storage bus activity',
-        [switch] $AllowPnpCycle
+        [switch] $AllowPnpCycle,
+        # Entries/disks to leave alone (e.g. just re-locked by Respin -Force).
+        [object[]] $Skip = @()
     )
 
     $state = Read-State
@@ -691,37 +783,32 @@ function Invoke-RespinDownLockedDisks {
     if ($locked.Count -eq 0) { return }
 
     # Guard against stale state: if a "locked" disk is actually online (e.g. the
-    # user brought it back via Disk Management), sending standby would park a
-    # mounted disk and stall its next access. Skip those and tell the user.
-    $onlineByKey = @{}
-    foreach ($d in Get-OnlineDisksSafe) {
-        $onlineByKey["n:$([int]$d.Number)"] = $true
-        $u = [string](Get-DiskProp $d 'UniqueId' '')
-        $s = ([string](Get-DiskProp $d 'SerialNumber' '')).Trim()
-        if ($u) { $onlineByKey["u:$u"] = $true }
-        if ($s) { $onlineByKey["s:$s"] = $true }
-    }
+    # user brought it back via Disk Management, or Windows re-onlined it after the
+    # device was re-enumerated), sending standby would park a mounted disk and stall
+    # its next access. Match by identity — another disk may have taken its number.
+    $onlineDisks = @(Get-OnlineDisksSafe)
 
     $directTargets = New-Object System.Collections.Generic.List[object]
     $pnpCycleTargets = New-Object System.Collections.Generic.List[object]
 
     foreach ($entry in $locked) {
-        $uid = [string](Get-DiskProp $entry 'UniqueId' '')
-        $serial = ([string](Get-DiskProp $entry 'SerialNumber' '')).Trim()
         $num = [int](Get-DiskProp $entry 'Number' -1)
         $name = [string](Get-DiskProp $entry 'FriendlyName' '')
 
-        $isOnline = $false
-        if ($uid -and $onlineByKey.ContainsKey("u:$uid")) { $isOnline = $true }
-        elseif ($serial -and $onlineByKey.ContainsKey("s:$serial")) { $isOnline = $true }
-        elseif ($num -ge 0 -and $onlineByKey.ContainsKey("n:$num")) { $isOnline = $true }
+        if (@($Skip | Where-Object { Test-SameDisk $entry $_ }).Count -gt 0) { continue }
 
-        if ($isOnline) {
-            Write-Warning ("  Disk {0} ({1}) is recorded as locked but is currently online; skipping standby. Run Unlock -DiskNumber {0} to clean up state." -f $num, $name)
+        $onlineMatch = @($onlineDisks | Where-Object { Test-SameDisk $entry $_ }) | Select-Object -First 1
+        if ($onlineMatch) {
+            Write-Warning ("  '{0}' (now Disk {1}) is recorded as locked but is currently online; skipping standby. Run 'Respin -Force' to re-lock it, or 'Unlock -DiskNumber {1}' to drop it from state." -f $name, [int]$onlineMatch.Number)
             continue
         }
 
         $pnpId = Get-DiskProp $entry 'PnpDeviceId' $null
+        if ($pnpId -or (Get-DiskProp $entry 'DeviceDisabled' $false)) {
+            # Heal a stale instance id before deciding how to reach the disk.
+            $resolved = Resolve-LockedEntryPnpId -Entry $entry
+            if ($resolved) { $pnpId = $resolved }
+        }
         $needsPnpCycle = $false
         if ($pnpId -and (Test-PnpInstanceDisabled -InstanceId $pnpId)) {
             $needsPnpCycle = $true
@@ -788,7 +875,7 @@ function Invoke-RespinDownLockedDisks {
             Write-Host ("  Enabling {0}..." -f $name)
             $enabled = Enable-DiskPnpDevice -InstanceId $pnpId
             if (-not $enabled) {
-                Write-Warning ("  Could not enable '{0}'; skipping standby." -f $name)
+                Write-Warning ("  Could not enable '{0}' ({1}); skipping standby." -f $name, $pnpId)
                 continue
             }
             try {
@@ -852,6 +939,40 @@ function Get-DiskProp {
     $p = $Disk.PSObject.Properties[$Name]
     if ($null -eq $p) { return $Default }
     return $p.Value
+}
+
+function Test-SameDisk {
+    <#
+      Identity match between disks and/or state entries. Disk numbers are not stable
+      (reboot, PnP enable, hot-plug all renumber), so Number is only compared when
+      neither side has a UniqueId or SerialNumber to go on.
+    #>
+    param($A, $B)
+    if ($null -eq $A -or $null -eq $B) { return $false }
+    $uA = ([string](Get-DiskProp $A 'UniqueId' '')).Trim()
+    $uB = ([string](Get-DiskProp $B 'UniqueId' '')).Trim()
+    if ($uA -and $uB) { return $uA -eq $uB }
+    $sA = ([string](Get-DiskProp $A 'SerialNumber' '')).Trim()
+    $sB = ([string](Get-DiskProp $B 'SerialNumber' '')).Trim()
+    if ($sA -and $sB) { return $sA -eq $sB }
+    $nA = Get-DiskProp $A 'Number' $null
+    $nB = Get-DiskProp $B 'Number' $null
+    return ($null -ne $nA -and $null -ne $nB -and [int]$nA -eq [int]$nB)
+}
+
+function Find-LockedEntryForDisk {
+    param([Parameter(Mandatory)] $Disk)
+    $stateEntry = Get-DiskProp $Disk '_StateEntry' $null
+    if ($stateEntry) { return $stateEntry }
+    foreach ($e in @((Read-State).LockedDisks)) {
+        if (Test-SameDisk $e $Disk) { return $e }
+    }
+    return $null
+}
+
+function Remove-LockedEntryFromState {
+    param([Parameter(Mandatory)] $State, [Parameter(Mandatory)] $Disk)
+    $State.LockedDisks = @(@($State.LockedDisks) | Where-Object { -not (Test-SameDisk $_ $Disk) })
 }
 
 function Get-DiskLetters {
@@ -972,22 +1093,6 @@ function Enable-DiskPnpDevice {
     }
 }
 
-function Wait-DiskNumberReady {
-    param(
-        [Parameter(Mandatory)][int] $Number,
-        [int] $TimeoutSec = 45
-    )
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $d = Get-Disk -Number $Number -ErrorAction Stop
-            if ($d) { return $d }
-        } catch { }
-        Start-Sleep -Milliseconds 500
-    }
-    throw ("Timed out waiting for Disk {0} to reappear after PnP enable ({1} sec)." -f $Number, $TimeoutSec)
-}
-
 function Test-IsProtectedDisk {
     param($Disk)
     # State-backed stubs are disks we already locked earlier — do not probe partitions
@@ -1086,6 +1191,10 @@ function Resolve-LockDiskList {
     $disks = New-Object System.Collections.Generic.List[object]
     $seen = @{}
     $lockedMap = Get-LockedDiskMap
+    # Online disks win over state: a saved Number may now belong to a different
+    # (online) disk, or the locked disk itself may have come back online.
+    $onlineByNumber = @{}
+    foreach ($d in Get-OnlineDisksSafe) { $onlineByNumber[[int]$d.Number] = $d }
 
     $numberTokens = ConvertTo-ArgTokenList $DiskNumber
     if ($null -eq $numberTokens) { $numberTokens = @() }
@@ -1096,7 +1205,9 @@ function Resolve-LockDiskList {
         }
         if ($seen.ContainsKey($n)) { continue }
 
-        if ($lockedMap.ContainsKey($n)) {
+        if ($onlineByNumber.ContainsKey($n)) {
+            [void]$disks.Add($onlineByNumber[$n])
+        } elseif ($lockedMap.ContainsKey($n)) {
             # Already locked: use state stub — Get-Disk would wake the drive.
             [void]$disks.Add((New-DiskStubFromState -Entry $lockedMap[$n]))
         } else {
@@ -1117,13 +1228,10 @@ function Resolve-LockDiskList {
         $disk = $null
 
         try {
+            # Mounted letter => the disk is online; always use the live disk.
             $part = Get-Partition -DriveLetter $letter -ErrorAction Stop
             $n = [int]$part.DiskNumber
-            if ($lockedMap.ContainsKey($n)) {
-                $disk = New-DiskStubFromState -Entry $lockedMap[$n]
-            } else {
-                $disk = Get-Disk -Number $n -ErrorAction Stop
-            }
+            $disk = Get-Disk -Number $n -ErrorAction Stop
         } catch {
             $entry = Find-LockedEntryByLetter -Letter $letter
             if ($entry) {
@@ -1149,6 +1257,27 @@ function Resolve-UnlockJobList {
     $state = Read-State
     $jobs = New-Object System.Collections.Generic.List[object]
     $seen = @{}
+
+    if ($All) {
+        if ($null -ne $DiskNumber -or $null -ne $DriveLetter) {
+            throw 'Use -All on its own, or pick disks with -DiskNumber / -DriveLetter.'
+        }
+        foreach ($entry in @($state.LockedDisks)) {
+            # Stubs for everything: Unlock-OneDisk re-enables PnP and resolves the
+            # live disk by identity, so stale saved numbers do not matter here.
+            $disk = New-DiskStubFromState -Entry $entry
+            [void]$jobs.Add([pscustomobject]@{
+                Entry  = $entry
+                Disk   = $disk
+                Number = [int]$disk.Number
+            })
+        }
+        if ($jobs.Count -eq 0) {
+            throw 'No disks are recorded as locked; nothing to unlock.'
+        }
+        Write-Output -NoEnumerate @($jobs.ToArray())
+        return
+    }
 
     $numberTokens = ConvertTo-ArgTokenList $DiskNumber
     if ($null -eq $numberTokens) { $numberTokens = @() }
@@ -1371,9 +1500,9 @@ function Get-LockedSizeText {
 }
 
 function Invoke-List {
-    $lockedMap = Get-LockedDiskMap
+    $lockedEntries = @((Read-State).LockedDisks)
     $rows = New-Object System.Collections.Generic.List[object]
-    $staleNumbers = @{}
+    $staleEntries = New-Object System.Collections.Generic.List[object]
 
     # Online disks only — never call Get-Partition on locked/offline disks.
     foreach ($d in (Get-OnlineDisksSafe | Sort-Object Number)) {
@@ -1389,10 +1518,11 @@ function Invoke-List {
                 [void]$flags.Add('Protected')
             }
         }
-        if ($lockedMap.ContainsKey($num)) {
+        $staleEntry = @($lockedEntries | Where-Object { Test-SameDisk $_ $d }) | Select-Object -First 1
+        if ($staleEntry) {
             # State says locked but the disk is online — stale entry. Show the
             # live row and flag it; skip the state-based row below.
-            $staleNumbers[$num] = $true
+            [void]$staleEntries.Add($staleEntry)
             [void]$flags.Add('StaleLock')
         }
 
@@ -1412,9 +1542,8 @@ function Invoke-List {
     }
 
     # Locked disks: state.json only — do not probe the hardware.
-    foreach ($num in ($lockedMap.Keys | Sort-Object)) {
-        if ($staleNumbers.ContainsKey([int]$num)) { continue }
-        $entry = $lockedMap[$num]
+    foreach ($entry in $lockedEntries) {
+        if ($staleEntries.Contains($entry)) { continue }
         $bus = '-'
         if ($entry.PSObject.Properties['BusType'] -and $entry.BusType) { $bus = [string]$entry.BusType }
 
@@ -1433,8 +1562,12 @@ function Invoke-List {
     $rows = @($rows | Sort-Object Number)
     $rows | Format-Table -Property Number, FriendlyName, Bus, Size, Offline, Letters, Flags, Serial -AutoSize |
         Out-String -Width 200 | Write-Host
-    if ($lockedMap.Count -gt 0) {
+    if ($lockedEntries.Count -gt 0) {
         Write-Host 'Note: Locked disks are listed from state only (not probed), so List will not spin them up.'
+        Write-Host '      Their Number is the last one seen; Windows may have renumbered them since.'
+    }
+    if ($staleEntries.Count -gt 0) {
+        Write-Host "StaleLock: run 'Respin -Force' to re-lock those disks, or 'Unlock' to drop them from state."
     }
 }
 
@@ -1465,19 +1598,20 @@ function Invoke-Status {
 function Lock-OneDisk {
     param(
         [Parameter(Mandatory)] $Disk,
-        [switch] $SkipSecondStandby
+        [switch] $SkipSecondStandby,
+        [bool] $PnpDisable = (-not $Soft)
     )
 
     $num = [int]$Disk.Number
-    $lockedMap = Get-LockedDiskMap
-    $alreadyTracked = $lockedMap.ContainsKey($num)
+    $trackedEntry = Find-LockedEntryForDisk -Disk $Disk
+    $alreadyTracked = $null -ne $trackedEntry
     $fromState = [bool](Get-DiskProp $Disk '_FromState' $false)
     $alreadyOffline = $fromState -or [bool](Get-DiskProp $Disk 'IsOffline' $false)
-    $usePnpDisable = -not $Soft
+    $usePnpDisable = $PnpDisable
 
     # Already offline + already in state: do not snapshot or wipe letters.
     if ($alreadyOffline -and $alreadyTracked) {
-        $entry = $lockedMap[$num]
+        $entry = $trackedEntry
         $letterList = Get-LockedLetters -Entry $entry
         if (-not $letterList) { $letterList = '(saved)' }
         Write-Host ("--- Disk {0}  {1} already locked (Letters={2})." -f `
@@ -1502,14 +1636,8 @@ function Lock-OneDisk {
                 if (-not $pnpId) { $pnpId = Get-DiskPnpInstanceId -Number $num }
                 if ($pnpId) {
                     $disabled = Disable-DiskPnpDevice -InstanceId $pnpId -DiskNumber $num
-                    $state = Read-State
-                    foreach ($e in @($state.LockedDisks)) {
-                        if ([int]$e.Number -eq $num) {
-                            $e | Add-Member -NotePropertyName PnpDeviceId -NotePropertyValue $pnpId -Force
-                            $e | Add-Member -NotePropertyName DeviceDisabled -NotePropertyValue ([bool]$disabled) -Force
-                        }
-                    }
-                    Write-State -State $state
+                    Update-LockedEntryField -Entry $entry -Name 'PnpDeviceId' -Value $pnpId
+                    Update-LockedEntryField -Entry $entry -Name 'DeviceDisabled' -Value ([bool]$disabled)
                     if ($disabled) {
                         Write-Host '  Upgraded lock to PnP-disabled.'
                     }
@@ -1538,7 +1666,7 @@ function Lock-OneDisk {
     $parts = @($parts)
 
     if ($parts.Count -eq 0 -and $alreadyTracked) {
-        $old = @($lockedMap[$num].Partitions)
+        $old = @(Get-DiskProp $trackedEntry 'Partitions' @())
         if (@($old).Count -gt 0) {
             Write-Warning ("Disk {0}: live snapshot has no letters; keeping previously saved partition letters." -f $num)
             $parts = @($old)
@@ -1619,16 +1747,9 @@ function Lock-OneDisk {
     }
 
     $state = Read-State
-    $remaining = @()
-    foreach ($e in @($state.LockedDisks)) {
-        $sameUnique = $snapshot.UniqueId -and $e.UniqueId -and ($e.UniqueId -eq $snapshot.UniqueId)
-        $sameNumber = ($null -ne $e.Number) -and ([int]$e.Number -eq [int]$snapshot.Number)
-        if (-not ($sameUnique -or $sameNumber)) {
-            $remaining += $e
-        }
-    }
-    $remaining += $snapshot
-    $state.LockedDisks = $remaining
+    # Identity match only: another locked disk may carry this Number in state.
+    Remove-LockedEntryFromState -State $state -Disk $snapshot
+    $state.LockedDisks = @($state.LockedDisks) + $snapshot
     Write-State -State $state
 
     Write-Host ("  Locked: Disk {0}." -f $Disk.Number)
@@ -1641,13 +1762,12 @@ function Invoke-Lock {
     $disks = @($disks)
 
     Write-Host ("Lock targets ({0}):" -f $disks.Count)
-    $lockedMap = Get-LockedDiskMap
     foreach ($disk in $disks) {
-        $num = [int]$disk.Number
-        if ((Get-DiskProp $disk '_FromState' $false) -or (Get-DiskProp $disk 'IsOffline' $false) -or $lockedMap.ContainsKey($num)) {
+        $tracked = Find-LockedEntryForDisk -Disk $disk
+        if ((Get-DiskProp $disk '_FromState' $false) -or (Get-DiskProp $disk 'IsOffline' $false)) {
             $letters = '-'
-            if ($lockedMap.ContainsKey($num)) {
-                $letters = Get-LockedLetters -Entry $lockedMap[$num]
+            if ($tracked) {
+                $letters = Get-LockedLetters -Entry $tracked
                 if (-not $letters) { $letters = '(locked)' }
             } else {
                 $letters = '(offline)'
@@ -1770,15 +1890,34 @@ function Unlock-OneDisk {
     if ($Entry) { $pnpId = Get-DiskProp $Entry 'PnpDeviceId' $null }
     $wasDisabled = $Entry -and (Get-DiskProp $Entry 'DeviceDisabled' $false)
 
+    if ($Entry -and ($pnpId -or $wasDisabled)) {
+        # The saved instance id goes stale when Windows re-enumerates the drive.
+        $resolved = Resolve-LockedEntryPnpId -Entry $Entry
+        if ($resolved) { $pnpId = $resolved }
+    }
+
     if ($pnpId -and $wasDisabled) {
-        Enable-DiskPnpDevice -InstanceId $pnpId
+        if (-not (Enable-DiskPnpDevice -InstanceId $pnpId)) {
+            throw ("Could not enable PnP device {0}. Enable '{1}' in Device Manager, then re-run Unlock." -f $pnpId, $Disk.FriendlyName)
+        }
         Start-Sleep -Milliseconds 800
-        $Disk = Wait-DiskNumberReady -Number $num -TimeoutSec 60
-        Write-Host ("  Disk {0} reappeared." -f $num)
+        # Match by identity: the disk usually comes back under a different number.
+        $Disk = Wait-DiskByLockedEntry -Entry $Entry -TimeoutSec 60
+        $num = [int]$Disk.Number
+        Write-Host ("  Disk reappeared as Disk {0}." -f $num)
     } elseif ($pnpId) {
         # State may have id without disabled flag — ensure enabled anyway.
-        try { Enable-DiskPnpDevice -InstanceId $pnpId } catch { }
-        try { $Disk = Get-Disk -Number $num -ErrorAction Stop } catch { }
+        try { [void](Enable-DiskPnpDevice -InstanceId $pnpId) } catch { }
+    }
+
+    if ($Entry -and (Get-DiskProp $Disk '_FromState' $false)) {
+        # Still a state stub: resolve the live disk by identity before touching it.
+        $live = Find-DiskByLockedEntry -Entry $Entry
+        if (-not $live) {
+            throw ("'{0}' was not found. If it is disabled in Device Manager, enable it there, then re-run Unlock." -f $Disk.FriendlyName)
+        }
+        $Disk = $live
+        $num = [int]$Disk.Number
     }
 
     if (-not (Get-DiskProp $Disk '_FromState' $false)) {
@@ -1805,15 +1944,7 @@ function Unlock-OneDisk {
 
     if ($Entry) {
         $state = Read-State
-        $remaining = @()
-        foreach ($e in @($state.LockedDisks)) {
-            $sameUnique = $Entry.UniqueId -and $e.UniqueId -and ($e.UniqueId -eq $Entry.UniqueId)
-            $sameNumber = ($null -ne $e.Number) -and ([int]$e.Number -eq [int]$Entry.Number)
-            if (-not ($sameUnique -or $sameNumber)) {
-                $remaining += $e
-            }
-        }
-        $state.LockedDisks = $remaining
+        Remove-LockedEntryFromState -State $state -Disk $Entry
         Write-State -State $state
     }
 
@@ -1874,8 +2005,44 @@ function Invoke-Respin {
         Write-Host 'No disks are recorded as locked; nothing to re-spindown.'
         return
     }
+
+    # Locked disks that are back online — typically Windows re-onlined them after
+    # re-enumerating the device as "new" (port change, driver/feature update).
+    $onlineDisks = @(Get-OnlineDisksSafe)
+    $relock = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @($state.LockedDisks)) {
+        $d = @($onlineDisks | Where-Object { Test-SameDisk $entry $_ }) | Select-Object -First 1
+        if ($d) { [void]$relock.Add($d) }
+    }
+
+    $relocked = New-Object System.Collections.Generic.List[object]
+    if ($relock.Count -gt 0) {
+        Write-Host ("{0} locked disk(s) are back online:" -f $relock.Count)
+        foreach ($d in $relock) {
+            $letters = (Get-DiskLetters -Disk $d) -join ','
+            if (-not $letters) { $letters = '-' }
+            Write-Host ("  Disk {0}  {1}  Letters={2}" -f $d.Number, $d.FriendlyName, $letters)
+        }
+        $doRelock = [bool]$Force
+        if (-not $doRelock) {
+            $answer = Read-Host 'Re-lock them now? (-Force skips this prompt) [y/N]'
+            $doRelock = $answer -match '^[Yy]'
+        }
+        if ($doRelock) {
+            foreach ($d in $relock) {
+                try {
+                    Lock-OneDisk -Disk $d -SkipSecondStandby
+                    [void]$relocked.Add($d)
+                } catch {
+                    Write-Warning ("Re-lock of Disk {0} failed: {1}" -f $d.Number, $_.Exception.Message)
+                }
+            }
+        }
+    }
+
     # Hard (PnP) locks have no PhysicalDrive handle until briefly re-enabled.
-    Invoke-RespinDownLockedDisks -Reason 'Respin' -AllowPnpCycle
+    # Skip the disks just re-locked: Lock-OneDisk already spun them down.
+    Invoke-RespinDownLockedDisks -Reason 'Respin' -AllowPnpCycle -Skip $relocked.ToArray()
 }
 
 function Invoke-Install {
@@ -1950,12 +2117,23 @@ if ($Action -in @('Lock', 'Unlock', 'Respin')) {
     }
 }
 
-switch ($Action) {
-    'List'    { Invoke-List }
-    'Status'  { Invoke-Status }
-    'Lock'    { Invoke-Lock }
-    'Unlock'  { Invoke-Unlock }
-    'Respin'  { Invoke-Respin }
-    'Install' { Invoke-Install }
-    default   { throw "Unknown action: $Action" }
+try {
+    switch ($Action) {
+        'List'    { Invoke-List }
+        'Status'  { Invoke-Status }
+        'Lock'    { Invoke-Lock }
+        'Unlock'  { Invoke-Unlock }
+        'Respin'  { Invoke-Respin }
+        'Install' { Invoke-Install }
+        default   { throw "Unknown action: $Action" }
+    }
+} catch {
+    Write-Host ''
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    if ($Elevated) {
+        Write-Host ''
+        Write-Host 'Press Enter to close...' -ForegroundColor DarkGray
+        [void](Read-Host)
+    }
+    exit 1
 }
